@@ -3,6 +3,7 @@ package commands
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -215,6 +216,137 @@ func (args *TraceCallParam) ToMessage(globalGasCap uint64, baseFee *uint256.Int)
 	}
 	msg := types.NewMessage(addr, args.To, 0, value, gas, gasPrice, gasFeeCap, gasTipCap, data, accessList, false /* checkNonce */)
 	return msg, nil
+}
+
+/*
+type StructLogger struct {
+	cfg LogConfig
+
+	storage map[common.Address]Storage
+	logs    []StructLog
+	output  []byte
+	err     error
+}
+
+type Tracer interface {
+	CaptureStart(env *EVM, depth int, from common.Address, to common.Address, precompile bool, create bool, callType CallType, input []byte, gas uint64, value *big.Int, code []byte)
+	CaptureState(env *EVM, pc uint64, op OpCode, gas, cost uint64, scope *ScopeContext, rData []byte, depth int, err error)
+	CaptureFault(env *EVM, pc uint64, op OpCode, gas, cost uint64, scope *ScopeContext, depth int, err error)
+	CaptureEnd(depth int, output []byte, startGas, endGas uint64, t time.Duration, err error)
+	CaptureSelfDestruct(from common.Address, to common.Address, value *big.Int)
+	CaptureAccountRead(account common.Address) error
+	CaptureAccountWrite(account common.Address) error
+}
+*/
+
+type AssetTransfer struct {
+	Address common.Address `json:"address"`
+	Asset   common.Address `json:"asset"`
+	Amount  *big.Int       `json:"amount"`
+}
+
+type AssetTransferResp struct {
+	Output    []byte           `json:"output"`
+	From      common.Address   `json:"from"`
+	To        common.Address   `json:"to"`
+	ErrCode   string           `json:"errorcode"`
+	Transfers []*AssetTransfer `json:"transfers"`
+}
+
+// Logs all erc20 asset transfers from/to address with amount.
+type AssetTracer struct {
+	Resp *AssetTransferResp
+}
+
+func NewAssetTracer() *AssetTracer {
+	res := &AssetTracer{}
+	res.Resp = &AssetTransferResp{}
+	res.Resp.Transfers = make([]*AssetTransfer, 0, 1)
+	return res
+}
+
+func (at *AssetTracer) CaptureStart(env *vm.EVM, depth int, from common.Address, to common.Address, precompile bool, create bool, calltype vm.CallType, input []byte, gas uint64, value *big.Int, code []byte) {
+	at.Resp.From = from
+	at.Resp.To = to
+}
+
+func (at *AssetTracer) CaptureState(env *vm.EVM, pc uint64, op vm.OpCode, gas, cost uint64, scope *vm.ScopeContext, rData []byte, depth int, err error) {
+	if err != nil {
+		at.Resp.ErrCode = err.Error()
+		return
+	}
+	if op == vm.CALL {
+		offset := scope.Stack.Back(3).Uint64() //stackArr[3].Uint64()
+		len := scope.Stack.Back(4).Uint64()
+		//fmt.Printf("CaptureState: opcode: %d offset: %s len: %s\n", op, stackArr[3].ToBig().Text(16), stackArr[4].ToBig().Text(16))
+		//scope.Stack.Print()
+		if len >= 4 {
+			len = 4
+		}
+		mem := scope.Memory.Data()
+		if offset+len > uint64(scope.Memory.Len()) {
+			return
+		}
+		calldata := mem[offset : offset+len]
+		//transfer(address,uint256) sig: 0xa9059cbb
+		function := "0x" + hex.EncodeToString(calldata[0:4])
+		//assetTransfers := make([]*AssetTransfer, 0, 1)
+		transfer := &AssetTransfer{}
+		transfer1 := &AssetTransfer{}
+		// check if transfer function is called
+		if function == "0xa9059cbb" {
+			// address of the token contract
+			transfer.Asset = common.HexToAddress("0x" + scope.Stack.Back(1).ToBig().Text(16))
+			transfer.Address = scope.Contract.Caller()
+			to := common.BytesToAddress(calldata[4:24])
+			amount := big.NewInt(0).SetBytes(calldata[24:56])
+			transfer1.Address = to
+			transfer1.Asset = transfer.Asset
+			transfer1.Amount = big.NewInt(0).Set(amount)
+			transfer.Amount = amount.Neg(amount)
+			// append transfers
+			at.Resp.Transfers = append(at.Resp.Transfers, transfer, transfer1)
+		} else if function == "0x23b872dd" { // transferFrom(address from, address to, uint256 amount)
+			// address of the token contract
+			transfer.Asset = common.HexToAddress("0x" + scope.Stack.Back(1).ToBig().Text(16))
+			transfer1.Asset = transfer.Asset
+			from := calldata[4:24]
+			transfer.Address = common.BytesToAddress(from)
+			to := common.BytesToAddress(calldata[24:44])
+			transfer1.Address = to
+			amount := big.NewInt(0).SetBytes(calldata[44:76])
+			transfer1.Amount = big.NewInt(0).Set(amount)
+			transfer.Amount = amount.Neg(amount)
+			// append transfers
+			at.Resp.Transfers = append(at.Resp.Transfers, transfer, transfer1)
+		}
+
+		//l.retValue.Calls = append(l.retValue.Calls, call)
+	}
+}
+
+func (at *AssetTracer) CaptureFault(env *vm.EVM, pc uint64, op vm.OpCode, gas, cost uint64, scope *vm.ScopeContext, depth int, err error) {
+	if err != nil {
+		at.Resp.ErrCode = err.Error()
+	}
+}
+
+func (at *AssetTracer) CaptureEnd(depth int, output []byte, startGas, endGas uint64, t time.Duration, err error) {
+	if err != nil {
+		at.Resp.ErrCode = err.Error()
+	}
+}
+
+func (at *AssetTracer) CaptureAccountRead(account common.Address) error {
+	return nil
+}
+
+func (at *AssetTracer) CaptureAccountWrite(account common.Address) error {
+	return nil
+}
+
+func (at *AssetTracer) CaptureSelfDestruct(from common.Address, to common.Address, value *big.Int) {
+
 }
 
 // OpenEthereum-style tracer
@@ -844,6 +976,145 @@ func (api *TraceAPIImpl) ReplayBlockTransactions(ctx context.Context, blockNrOrH
 	}
 
 	return result, nil
+}
+
+// implementation largely copied from Call. Uses an AssetTracer rather than OeTracer.
+func (api *TraceAPIImpl) CallAssets(ctx context.Context, args TraceCallParam, traceTypes []string, blockNrOrHash *rpc.BlockNumberOrHash) (*AssetTransferResp, error) {
+	tx, err := api.kv.BeginRo(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	chainConfig, err := api.chainConfig(tx)
+	if err != nil {
+		return nil, err
+	}
+
+	if blockNrOrHash == nil {
+		var num = rpc.LatestBlockNumber
+		blockNrOrHash = &rpc.BlockNumberOrHash{BlockNumber: &num}
+	}
+
+	blockNumber, hash, latest, err := rpchelper.GetBlockNumber(*blockNrOrHash, tx, api.filters)
+	if err != nil {
+		return nil, err
+	}
+	var stateReader state.StateReader
+	if latest {
+		cacheView, err := api.stateCache.View(ctx, tx)
+		if err != nil {
+			return nil, err
+		}
+		stateReader = state.NewCachedReader2(cacheView, tx)
+	} else {
+		stateReader = state.NewPlainState(tx, blockNumber+1)
+	}
+	ibs := state.New(stateReader)
+
+	block, err := api.blockWithSenders(tx, hash, blockNumber)
+	if err != nil {
+		return nil, err
+	}
+	if block == nil {
+		return nil, fmt.Errorf("block %d(%x) not found", blockNumber, hash)
+	}
+	header := block.Header()
+
+	// Setup context so it may be cancelled the call has completed
+	// or, in case of unmetered gas, setup a context with a timeout.
+	var cancel context.CancelFunc
+	if api.evmCallTimeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, api.evmCallTimeout)
+	} else {
+		ctx, cancel = context.WithCancel(ctx)
+	}
+
+	// Make sure the context is cancelled when the call has completed
+	// this makes sure resources are cleaned up.
+	defer cancel()
+
+	/* ignore tracetype
+	traceResult := &TraceCallResult{Trace: []*ParityTrace{}}
+	var traceTypeTrace, traceTypeStateDiff, traceTypeVmTrace bool
+	for _, traceType := range traceTypes {
+		switch traceType {
+		case TraceTypeTrace:
+			traceTypeTrace = true
+		case TraceTypeStateDiff:
+			traceTypeStateDiff = true
+		case TraceTypeVmTrace:
+			traceTypeVmTrace = true
+		default:
+			return nil, fmt.Errorf("unrecognized trace type: %s", traceType)
+		}
+	}
+	if traceTypeVmTrace {
+		traceResult.VmTrace = &VmTrace{Ops: []*VmTraceOp{}}
+	}
+	var ot OeTracer
+	ot.compat = api.compatibility
+	if traceTypeTrace || traceTypeVmTrace {
+		ot.r = traceResult
+		ot.traceAddr = []int{}
+	}*/
+
+	// Get a new instance of the EVM.
+	var baseFee *uint256.Int
+	if header != nil && header.BaseFee != nil {
+		var overflow bool
+		baseFee, overflow = uint256.FromBig(header.BaseFee)
+		if overflow {
+			return nil, fmt.Errorf("header.BaseFee uint256 overflow")
+		}
+	}
+	msg, err := args.ToMessage(api.gasCap, baseFee)
+	if err != nil {
+		return nil, err
+	}
+
+	blockCtx, txCtx := transactions.GetEvmContext(msg, header, blockNrOrHash.RequireCanonical, tx, api._blockReader)
+	blockCtx.GasLimit = math.MaxUint64
+	blockCtx.MaxGasLimit = true
+
+	// get an assettracer
+	assetTrace := NewAssetTracer()
+	evm := vm.NewEVM(blockCtx, txCtx, ibs, chainConfig, vm.Config{Debug: true, Tracer: assetTrace})
+
+	// Wait for the context to be done and cancel the evm. Even if the
+	// EVM has finished, cancelling may be done (repeatedly)
+	go func() {
+		<-ctx.Done()
+		evm.Cancel()
+	}()
+
+	gp := new(core.GasPool).AddGas(msg.Gas())
+	var execResult *core.ExecutionResult
+	ibs.Prepare(common.Hash{}, common.Hash{}, 0)
+	execResult, err = core.ApplyMessage(evm, msg, gp, true /* refunds */, true /* gasBailout */)
+	if err != nil {
+		return nil, err
+	}
+	assetTrace.Resp.Output = common.CopyBytes(execResult.ReturnData)
+	//traceResult.Output = common.CopyBytes(execResult.ReturnData)
+	/*if traceTypeStateDiff {
+		sdMap := make(map[common.Address]*StateDiffAccount)
+		traceResult.StateDiff = sdMap
+		sd := &StateDiff{sdMap: sdMap}
+		if err = ibs.FinalizeTx(evm.ChainRules(), sd); err != nil {
+			return nil, err
+		}
+		// Create initial IntraBlockState, we will compare it with ibs (IntraBlockState after the transaction)
+		initialIbs := state.New(stateReader)
+		sd.CompareStates(initialIbs, ibs)
+	}*/
+
+	// If the timer caused an abort, return an appropriate error message
+	if evm.Cancelled() {
+		return nil, fmt.Errorf("execution aborted (timeout = %v)", api.evmCallTimeout)
+	}
+
+	return assetTrace.Resp, nil
 }
 
 // Call implements trace_call.
