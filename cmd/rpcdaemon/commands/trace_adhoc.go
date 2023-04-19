@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"math/big"
 	"strings"
 
 	"github.com/holiman/uint256"
@@ -230,28 +231,28 @@ type StructLogger struct {
 }
 
 type Tracer interface {
-	CaptureStart(env *EVM, depth int, from common.Address, to common.Address, precompile bool, create bool, callType CallType, input []byte, gas uint64, value *big.Int, code []byte)
+	CaptureStart(env *EVM, depth int, from libcommon.Address, to libcommon.Address, precompile bool, create bool, callType CallType, input []byte, gas uint64, value *big.Int, code []byte)
 	CaptureState(env *EVM, pc uint64, op OpCode, gas, cost uint64, scope *ScopeContext, rData []byte, depth int, err error)
 	CaptureFault(env *EVM, pc uint64, op OpCode, gas, cost uint64, scope *ScopeContext, depth int, err error)
 	CaptureEnd(depth int, output []byte, startGas, endGas uint64, t time.Duration, err error)
-	CaptureSelfDestruct(from common.Address, to common.Address, value *big.Int)
-	CaptureAccountRead(account common.Address) error
-	CaptureAccountWrite(account common.Address) error
+	CaptureSelfDestruct(from libcommon.Address, to libcommon.Address, value *big.Int)
+	CaptureAccountRead(account libcommon.Address) error
+	CaptureAccountWrite(account libcommon.Address) error
 }
 */
 
 type AssetTransfer struct {
-	Address common.Address `json:"address"`
-	Asset   common.Address `json:"asset"`
-	Amount  *big.Int       `json:"amount"`
+	Address libcommon.Address `json:"address"`
+	Asset   libcommon.Address `json:"asset"`
+	Amount  *big.Int          `json:"amount"`
 }
 
 type AssetTransferResp struct {
-	Output    []byte           `json:"output"`
-	From      common.Address   `json:"from"`
-	To        common.Address   `json:"to"`
-	ErrCode   string           `json:"errorcode"`
-	Transfers []*AssetTransfer `json:"transfers"`
+	Output    []byte            `json:"output"`
+	From      libcommon.Address `json:"from"`
+	To        libcommon.Address `json:"to"`
+	ErrCode   string            `json:"errorcode"`
+	Transfers []*AssetTransfer  `json:"transfers"`
 }
 
 // Logs all erc20 asset transfers from/to address with amount.
@@ -266,12 +267,20 @@ func NewAssetTracer() *AssetTracer {
 	return res
 }
 
-func (at *AssetTracer) CaptureStart(env *vm.EVM, depth int, from common.Address, to common.Address, precompile bool, create bool, calltype vm.CallType, input []byte, gas uint64, value *big.Int, code []byte) {
+func (at *AssetTracer) CaptureStart(env vm.VMInterface, from libcommon.Address, to libcommon.Address, precompile bool, create bool, input []byte, gas uint64, value *uint256.Int, code []byte) {
 	at.Resp.From = from
 	at.Resp.To = to
 }
 
-func (at *AssetTracer) CaptureState(env *vm.EVM, pc uint64, op vm.OpCode, gas, cost uint64, scope *vm.ScopeContext, rData []byte, depth int, err error) {
+func (at *AssetTracer) CaptureEnter(typ vm.OpCode, from libcommon.Address, to libcommon.Address, precompile bool, create bool, input []byte, gas uint64, value *uint256.Int, code []byte) {
+
+}
+
+// Transaction level
+func (at *AssetTracer) CaptureTxStart(gasLimit uint64) {}
+func (at *AssetTracer) CaptureTxEnd(restGas uint64)    {}
+
+func (at *AssetTracer) CaptureState(pc uint64, op vm.OpCode, gas, cost uint64, scope *vm.ScopeContext, rData []byte, depth int, err error) {
 	if err != nil {
 		at.Resp.ErrCode = err.Error()
 		return
@@ -297,9 +306,9 @@ func (at *AssetTracer) CaptureState(env *vm.EVM, pc uint64, op vm.OpCode, gas, c
 		// check if transfer function is called
 		if function == "0xa9059cbb" {
 			// address of the token contract
-			transfer.Asset = common.HexToAddress("0x" + scope.Stack.Back(1).ToBig().Text(16))
+			transfer.Asset = libcommon.HexToAddress("0x" + scope.Stack.Back(1).ToBig().Text(16))
 			transfer.Address = scope.Contract.Caller()
-			to := common.BytesToAddress(calldata[4:24])
+			to := libcommon.BytesToAddress(calldata[4:24])
 			amount := big.NewInt(0).SetBytes(calldata[24:56])
 			transfer1.Address = to
 			transfer1.Asset = transfer.Asset
@@ -309,11 +318,11 @@ func (at *AssetTracer) CaptureState(env *vm.EVM, pc uint64, op vm.OpCode, gas, c
 			at.Resp.Transfers = append(at.Resp.Transfers, transfer, transfer1)
 		} else if function == "0x23b872dd" { // transferFrom(address from, address to, uint256 amount)
 			// address of the token contract
-			transfer.Asset = common.HexToAddress("0x" + scope.Stack.Back(1).ToBig().Text(16))
+			transfer.Asset = libcommon.HexToAddress("0x" + scope.Stack.Back(1).ToBig().Text(16))
 			transfer1.Asset = transfer.Asset
 			from := calldata[4:24]
-			transfer.Address = common.BytesToAddress(from)
-			to := common.BytesToAddress(calldata[24:44])
+			transfer.Address = libcommon.BytesToAddress(from)
+			to := libcommon.BytesToAddress(calldata[24:44])
 			transfer1.Address = to
 			amount := big.NewInt(0).SetBytes(calldata[44:76])
 			transfer1.Amount = big.NewInt(0).Set(amount)
@@ -326,27 +335,29 @@ func (at *AssetTracer) CaptureState(env *vm.EVM, pc uint64, op vm.OpCode, gas, c
 	}
 }
 
-func (at *AssetTracer) CaptureFault(env *vm.EVM, pc uint64, op vm.OpCode, gas, cost uint64, scope *vm.ScopeContext, depth int, err error) {
+func (at *AssetTracer) CaptureFault(pc uint64, op vm.OpCode, gas, cost uint64, scope *vm.ScopeContext, depth int, err error) {
 	if err != nil {
 		at.Resp.ErrCode = err.Error()
 	}
 }
 
-func (at *AssetTracer) CaptureEnd(depth int, output []byte, startGas, endGas uint64, t time.Duration, err error) {
+func (at *AssetTracer) CaptureEnd(output []byte, usedGas uint64, err error) {
 	if err != nil {
 		at.Resp.ErrCode = err.Error()
 	}
 }
 
-func (at *AssetTracer) CaptureAccountRead(account common.Address) error {
+func (at *AssetTracer) CaptureExit(output []byte, usedGas uint64, err error) {}
+
+func (at *AssetTracer) CaptureAccountRead(account libcommon.Address) error {
 	return nil
 }
 
-func (at *AssetTracer) CaptureAccountWrite(account common.Address) error {
+func (at *AssetTracer) CaptureAccountWrite(account libcommon.Address) error {
 	return nil
 }
 
-func (at *AssetTracer) CaptureSelfDestruct(from common.Address, to common.Address, value *big.Int) {
+func (at *AssetTracer) CaptureSelfDestruct(from libcommon.Address, to libcommon.Address, value *big.Int) {
 
 }
 
@@ -1087,7 +1098,9 @@ func (api *TraceAPIImpl) CallAssets(ctx context.Context, args TraceCallParam, tr
 		return nil, err
 	}
 
-	blockCtx, txCtx := transactions.GetEvmContext(msg, header, blockNrOrHash.RequireCanonical, tx, api._blockReader)
+	blockCtx := transactions.NewEVMBlockContext(engine, header, blockNrOrHash.RequireCanonical, tx, api._blockReader)
+	txCtx := core.NewEVMTxContext(msg)
+
 	blockCtx.GasLimit = math.MaxUint64
 	blockCtx.MaxGasLimit = true
 
@@ -1104,7 +1117,7 @@ func (api *TraceAPIImpl) CallAssets(ctx context.Context, args TraceCallParam, tr
 
 	gp := new(core.GasPool).AddGas(msg.Gas())
 	var execResult *core.ExecutionResult
-	ibs.Prepare(common.Hash{}, common.Hash{}, 0)
+	ibs.Prepare(libcommon.Hash{}, libcommon.Hash{}, 0)
 	execResult, err = core.ApplyMessage(evm, msg, gp, true /* refunds */, true /* gasBailout */)
 	if err != nil {
 		return nil, err
