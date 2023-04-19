@@ -4,16 +4,23 @@ import (
 	"context"
 	"encoding/binary"
 	"flag"
+	"fmt"
 	"os"
 	"time"
 
 	"github.com/c2h5oh/datasize"
+	libcommon "github.com/ledgerwatch/erigon-lib/common"
+	"github.com/ledgerwatch/erigon-lib/etl"
 	"github.com/ledgerwatch/erigon-lib/kv"
 	"github.com/ledgerwatch/erigon-lib/kv/mdbx"
+	"github.com/ledgerwatch/log/v3"
+	"go.uber.org/zap/buffer"
+
+	"github.com/ledgerwatch/erigon/cl/utils"
 	"github.com/ledgerwatch/erigon/cmd/verkle/verkletrie"
 	"github.com/ledgerwatch/erigon/common"
+	"github.com/ledgerwatch/erigon/core/types/accounts"
 	"github.com/ledgerwatch/erigon/eth/stagedsync/stages"
-	"github.com/ledgerwatch/log/v3"
 )
 
 type optionsCfg struct {
@@ -24,6 +31,8 @@ type optionsCfg struct {
 	tmpdir          string
 	disabledLookups bool
 }
+
+const DumpSize = uint64(20000000000)
 
 func IncrementVerkleTree(cfg optionsCfg) error {
 	start := time.Now()
@@ -165,7 +174,7 @@ func GenerateVerkleTree(cfg optionsCfg) error {
 	// Verkle Tree to be built
 	log.Info("Started Verkle Tree creation")
 
-	var root common.Hash
+	var root libcommon.Hash
 	if root, err = verkleWriter.CommitVerkleTreeFromScratch(); err != nil {
 		return err
 	}
@@ -222,11 +231,13 @@ func dump(cfg optionsCfg) error {
 	}
 	defer tx.Rollback()
 	logInterval := time.NewTicker(30 * time.Second)
-	file, err := os.Create("dump.txt")
+	num := 0
+	file, err := os.Create(fmt.Sprintf("dump%d", num))
 	if err != nil {
 		return err
 	}
-	defer file.Close()
+	currWritten := uint64(0)
+
 	verkleCursor, err := tx.Cursor(kv.VerkleTrie)
 	if err != nil {
 		return err
@@ -235,19 +246,34 @@ func dump(cfg optionsCfg) error {
 		if err != nil {
 			return err
 		}
+		if len(k) != 32 {
+			continue
+		}
 		// k is the root so it will always be 32 bytes
 		if _, err := file.Write(k); err != nil {
 			return err
 		}
+		currWritten += 32
 		// Write length of RLP encoded note
 		lenNode := make([]byte, 8)
 		binary.BigEndian.PutUint64(lenNode, uint64(len(v)))
 		if _, err := file.Write(lenNode); err != nil {
 			return err
 		}
+		currWritten += 8
 		// Write Rlp encoded node
 		if _, err := file.Write(v); err != nil {
 			return err
+		}
+		currWritten += uint64(len(v))
+		if currWritten > DumpSize {
+			file.Close()
+			currWritten = 0
+			num++
+			file, err = os.Create(fmt.Sprintf("dump%d", num))
+			if err != nil {
+				return err
+			}
 		}
 		select {
 		case <-logInterval.C:
@@ -255,6 +281,142 @@ func dump(cfg optionsCfg) error {
 		default:
 		}
 	}
+	file.Close()
+	return nil
+}
+
+func dump_acc_preimages(cfg optionsCfg) error {
+	db, err := mdbx.Open(cfg.stateDb, log.Root(), false)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	tx, err := db.BeginRw(cfg.ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	logInterval := time.NewTicker(30 * time.Second)
+	file, err := os.Create("dump_accounts")
+	if err != nil {
+		return err
+	}
+
+	stateCursor, err := tx.Cursor(kv.PlainState)
+	if err != nil {
+		return err
+	}
+	num, err := stages.GetStageProgress(tx, stages.Execution)
+	if err != nil {
+		return err
+	}
+	log.Info("Current Block Number", "num", num)
+	for k, _, err := stateCursor.First(); k != nil; k, _, err = stateCursor.Next() {
+		if err != nil {
+			return err
+		}
+		if len(k) != 20 {
+			continue
+		}
+		// Address
+		if _, err := file.Write(k); err != nil {
+			return err
+		}
+		addressHash := utils.Keccak256(k)
+
+		if _, err := file.Write(addressHash[:]); err != nil {
+			return err
+		}
+
+		select {
+		case <-logInterval.C:
+			log.Info("Dumping preimages to plain text", "key", common.Bytes2Hex(k))
+		default:
+		}
+	}
+	file.Close()
+	return nil
+}
+
+func dump_storage_preimages(cfg optionsCfg) error {
+	db, err := mdbx.Open(cfg.stateDb, log.Root(), false)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	tx, err := db.BeginRw(cfg.ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	logInterval := time.NewTicker(30 * time.Second)
+	file, err := os.Create("dump_storage")
+	if err != nil {
+		return err
+	}
+	collector := etl.NewCollector(".", "/tmp", etl.NewSortableBuffer(etl.BufferOptimalSize))
+	defer collector.Close()
+	stateCursor, err := tx.Cursor(kv.PlainState)
+	if err != nil {
+		return err
+	}
+	num, err := stages.GetStageProgress(tx, stages.Execution)
+	if err != nil {
+		return err
+	}
+	log.Info("Current Block Number", "num", num)
+	var currentIncarnation uint64
+	var currentAddress libcommon.Address
+	var addressHash libcommon.Hash
+	var buf buffer.Buffer
+	for k, v, err := stateCursor.First(); k != nil; k, v, err = stateCursor.Next() {
+		if err != nil {
+			return err
+		}
+		if len(k) == 20 {
+			if currentAddress != (libcommon.Address{}) {
+				if err := collector.Collect(addressHash[:], buf.Bytes()); err != nil {
+					return err
+				}
+			}
+			buf.Reset()
+			var acc accounts.Account
+			if err := acc.DecodeForStorage(v); err != nil {
+				return err
+			}
+			currentAddress = libcommon.BytesToAddress(k)
+			currentIncarnation = acc.Incarnation
+			addressHash = utils.Keccak256(currentAddress[:])
+		} else {
+			address := libcommon.BytesToAddress(k[:20])
+			if address != currentAddress {
+				continue
+			}
+			if binary.BigEndian.Uint64(k[20:]) != currentIncarnation {
+				continue
+			}
+			storageHash := utils.Keccak256(k[28:])
+			buf.Write(k[28:])
+			buf.Write(storageHash[:])
+		}
+
+		select {
+		case <-logInterval.C:
+			log.Info("Computing preimages to plain text", "key", common.Bytes2Hex(k))
+		default:
+		}
+	}
+	if err := collector.Collect(addressHash[:], buf.Bytes()); err != nil {
+		return err
+	}
+	collector.Load(tx, "", func(k, v []byte, _ etl.CurrentTableReader, next etl.LoadNextFunc) error {
+		_, err := file.Write(v)
+		return err
+	}, etl.TransformArgs{})
+	file.Close()
 	return nil
 }
 
@@ -298,6 +460,14 @@ func main() {
 	case "dump":
 		log.Info("Dumping in dump.txt")
 		if err := dump(opt); err != nil {
+			log.Error("Error", "err", err.Error())
+		}
+	case "acc_preimages":
+		if err := dump_acc_preimages(opt); err != nil {
+			log.Error("Error", "err", err.Error())
+		}
+	case "storage_preimages":
+		if err := dump_storage_preimages(opt); err != nil {
 			log.Error("Error", "err", err.Error())
 		}
 	default:
