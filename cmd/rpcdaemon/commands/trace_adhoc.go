@@ -1007,26 +1007,23 @@ func (api *TraceAPIImpl) CallAssets(ctx context.Context, args TraceCallParam, tr
 	if err != nil {
 		return nil, err
 	}
+	engine := api.engine()
 
 	if blockNrOrHash == nil {
 		var num = rpc.LatestBlockNumber
 		blockNrOrHash = &rpc.BlockNumberOrHash{BlockNumber: &num}
 	}
 
-	blockNumber, hash, latest, err := rpchelper.GetBlockNumber(*blockNrOrHash, tx, api.filters)
+	blockNumber, hash, _, err := rpchelper.GetBlockNumber(*blockNrOrHash, tx, api.filters)
 	if err != nil {
 		return nil, err
 	}
-	var stateReader state.StateReader
-	if latest {
-		cacheView, err := api.stateCache.View(ctx, tx)
-		if err != nil {
-			return nil, err
-		}
-		stateReader = state.NewCachedReader2(cacheView, tx)
-	} else {
-		stateReader = state.NewPlainState(tx, blockNumber+1)
+
+	stateReader, err := rpchelper.CreateStateReader(ctx, tx, *blockNrOrHash, 0, api.filters, api.stateCache, api.historyV3(tx), chainConfig.ChainName)
+	if err != nil {
+		return nil, err
 	}
+
 	ibs := state.New(stateReader)
 
 	block, err := api.blockWithSenders(tx, hash, blockNumber)
