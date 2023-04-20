@@ -1,22 +1,49 @@
 package commands
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
-	"math/big"
 
 	"github.com/holiman/uint256"
 	libcommon "github.com/ledgerwatch/erigon-lib/common"
+	"github.com/ledgerwatch/erigon-lib/kv"
+	types2 "github.com/ledgerwatch/erigon-lib/types"
 	"github.com/ledgerwatch/erigon/common"
 	"github.com/ledgerwatch/erigon/common/hexutil"
 	"github.com/ledgerwatch/erigon/common/math"
 	"github.com/ledgerwatch/erigon/core"
 	"github.com/ledgerwatch/erigon/core/state"
+	"github.com/ledgerwatch/erigon/core/types"
 	"github.com/ledgerwatch/erigon/core/vm"
 	"github.com/ledgerwatch/erigon/rpc"
+	"github.com/ledgerwatch/erigon/turbo/adapter/ethapi"
 	"github.com/ledgerwatch/erigon/turbo/rpchelper"
+	"github.com/ledgerwatch/erigon/turbo/shards"
 	"github.com/ledgerwatch/erigon/turbo/transactions"
 )
+
+type SimulateTransaction struct {
+	Overrides            *ethapi.StateOverrides `json:"overrides"`
+	From                 *libcommon.Address     `json:"from"`
+	To                   *libcommon.Address     `json:"to"`
+	Gas                  *hexutil.Uint64        `json:"gas"`
+	GasPrice             *hexutil.Big           `json:"gasPrice"`
+	MaxPriorityFeePerGas *hexutil.Big           `json:"maxPriorityFeePerGas"`
+	MaxFeePerGas         *hexutil.Big           `json:"maxFeePerGas"`
+	Value                *hexutil.Big           `json:"value"`
+	Data                 hexutil.Bytes          `json:"data"`
+	AccessList           *types2.AccessList     `json:"accessList"`
+	txHash               *libcommon.Hash
+}
+
+// SimulateParam
+type SimulateParam struct {
+	Overrides *ethapi.StateOverrides `json:"overrides"`
+	// array of TraceCallParam
+	Transactions json.RawMessage `json:"transactions"`
+}
 
 type TxCall struct {
 	Address  *libcommon.Address `json:"address"`
@@ -30,7 +57,7 @@ type TxLog struct {
 }
 
 type SimulationResult struct {
-	TotalEthTransfer *big.Int      `json:"total_eth"`
+	TotalEthTransfer *hexutil.Big  `json:"total_eth"`
 	Output           hexutil.Bytes `json:"output"`
 	ErrCode          string        `json:"errcode"`
 	Valid            bool          `json:"valid"`
@@ -43,13 +70,14 @@ type SimulationTracer struct {
 }
 
 func NewSimulationTracer() *SimulationTracer {
-	res := &SimulationTracer{}
-	res.Resp = &SimulationResult{}
-	res.Resp.Calls = make([]TxCall, 0, 1)
-	res.Resp.Logs = make([]TxLog, 0, 1)
-	res.Resp.TotalEthTransfer = big.NewInt(0)
-	res.Resp.Valid = true
-	return res
+	return &SimulationTracer{
+		Resp: &SimulationResult{
+			Calls:            []TxCall{},
+			Logs:             []TxLog{},
+			TotalEthTransfer: new(hexutil.Big),
+			Valid:            true,
+		},
+	}
 }
 
 // Transaction level
@@ -183,45 +211,47 @@ func (st *SimulationTracer) CaptureFault(pc uint64, op vm.OpCode, gas, cost uint
 
 }
 
-func (api *ErigonImpl) SimulateTransactions(ctx context.Context, args TraceCallParam, traceTypes []string, blockNrOrHash *rpc.BlockNumberOrHash) (*SimulationResult, error) {
-	tx, err := api.db.BeginRo(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	defer tx.Rollback()
-
-	chainConfig, err := api.chainConfig(tx)
+func (api *ErigonImpl) doSimulateTransactions(ctx context.Context, dbtx kv.Tx, msgs []types.Message, callParams []TraceCallParam, parentNrOrHash *rpc.BlockNumberOrHash, header *types.Header, gasBailout bool, overrides *ethapi.StateOverrides) ([]*SimulationResult, error) {
+	chainConfig, err := api.chainConfig(dbtx)
 	if err != nil {
 		return nil, err
 	}
 	engine := api.engine()
 
-	if blockNrOrHash == nil {
+	if parentNrOrHash == nil {
 		var num = rpc.LatestBlockNumber
-		blockNrOrHash = &rpc.BlockNumberOrHash{BlockNumber: &num}
+		parentNrOrHash = &rpc.BlockNumberOrHash{BlockNumber: &num}
 	}
-
-	blockNumber, hash, _, err := rpchelper.GetBlockNumber(*blockNrOrHash, tx, api.filters)
+	blockNumber, hash, _, err := rpchelper.GetBlockNumber(*parentNrOrHash, dbtx, api.filters)
 	if err != nil {
 		return nil, err
 	}
-
-	stateReader, err := rpchelper.CreateStateReader(ctx, tx, *blockNrOrHash, 0, api.filters, api.stateCache, api.historyV3(tx), chainConfig.ChainName)
+	stateReader, err := rpchelper.CreateStateReader(ctx, dbtx, *parentNrOrHash, 0, api.filters, api.stateCache, api.historyV3(dbtx), chainConfig.ChainName)
 	if err != nil {
 		return nil, err
 	}
+	stateCache := shards.NewStateCache(32, 0 /* no limit */) // this cache living only during current RPC call, but required to store state writes
+	cachedReader := state.NewCachedReader(stateReader, stateCache)
+	noop := state.NewNoopWriter()
+	cachedWriter := state.NewCachedWriter(noop, stateCache)
+	ibs := state.New(cachedReader)
 
-	ibs := state.New(stateReader)
+	// Override the fields of specified contracts before execution.
+	if overrides != nil {
+		if err := overrides.Override(ibs); err != nil {
+			return nil, err
+		}
+	}
 
-	block, err := api.blockWithSenders(tx, hash, blockNumber)
+	// TODO: can read here only parent header
+	parentBlock, err := api.blockWithSenders(dbtx, hash, blockNumber)
 	if err != nil {
 		return nil, err
 	}
-	if block == nil {
-		return nil, fmt.Errorf("block %d(%x) not found", blockNumber, hash)
+	parentHeader := parentBlock.Header()
+	if parentHeader == nil {
+		return nil, fmt.Errorf("parent header %d(%x) not found", blockNumber, hash)
 	}
-	header := block.Header()
 
 	// Setup context so it may be cancelled the call has completed
 	// or, in case of unmetered gas, setup a context with a timeout.
@@ -235,88 +265,193 @@ func (api *ErigonImpl) SimulateTransactions(ctx context.Context, args TraceCallP
 	// Make sure the context is cancelled when the call has completed
 	// this makes sure resources are cleaned up.
 	defer cancel()
+	results := []*SimulationResult{}
 
-	/* ignore tracetype
-	traceResult := &TraceCallResult{Trace: []*ParityTrace{}}
-	var traceTypeTrace, traceTypeStateDiff, traceTypeVmTrace bool
-	for _, traceType := range traceTypes {
-		switch traceType {
-		case TraceTypeTrace:
-			traceTypeTrace = true
-		case TraceTypeStateDiff:
-			traceTypeStateDiff = true
-		case TraceTypeVmTrace:
-			traceTypeVmTrace = true
-		default:
-			return nil, fmt.Errorf("unrecognized trace type: %s", traceType)
+	useParent := false
+	if header == nil {
+		header = parentHeader
+		useParent = true
+	}
+
+	for txIndex, msg := range msgs {
+		if err := libcommon.Stopped(ctx.Done()); err != nil {
+			return nil, err
+		}
+		args := callParams[txIndex]
+		traceResult := &SimulationResult{}
+		/*var traceTypeTrace, traceTypeStateDiff, traceTypeVmTrace bool
+		args := callParams[txIndex]
+		for _, traceType := range args.traceTypes {
+			switch traceType {
+			case TraceTypeTrace:
+				traceTypeTrace = true
+			case TraceTypeStateDiff:
+				traceTypeStateDiff = true
+			case TraceTypeVmTrace:
+				traceTypeVmTrace = true
+			default:
+				return nil, fmt.Errorf("unrecognized trace type: %s", traceType)
+			}
+		}*/
+		/*vmConfig := vm.Config{}
+		if (traceTypeTrace && (txIndexNeeded == -1 || txIndex == txIndexNeeded)) || traceTypeVmTrace {
+			var ot OeTracer
+			ot.compat = api.compatibility
+			ot.r = traceResult
+			ot.idx = []string{fmt.Sprintf("%d-", txIndex)}
+			if traceTypeTrace && (txIndexNeeded == -1 || txIndex == txIndexNeeded) {
+				ot.traceAddr = []int{}
+			}
+			if traceTypeVmTrace {
+				traceResult.VmTrace = &VmTrace{Ops: []*VmTraceOp{}}
+			}
+			vmConfig.Debug = true
+			vmConfig.Tracer = &ot
+		}*/
+
+		// Get a new instance of the EVM.
+		blockCtx := transactions.NewEVMBlockContext(engine, header, parentNrOrHash.RequireCanonical, dbtx, api._blockReader)
+		txCtx := core.NewEVMTxContext(msg)
+
+		if useParent {
+			blockCtx.GasLimit = math.MaxUint64
+			blockCtx.MaxGasLimit = true
+		}
+		ibs.Reset()
+		// Create initial IntraBlockState, we will compare it with ibs (IntraBlockState after the transaction)
+		simTracer := NewSimulationTracer()
+		simTracer.Resp = traceResult
+		evm := vm.NewEVM(blockCtx, txCtx, ibs, chainConfig, vm.Config{Tracer: simTracer, Debug: true})
+
+		gp := new(core.GasPool).AddGas(msg.Gas())
+		var execResult *core.ExecutionResult
+		// Clone the state cache before applying the changes, clone is discarded
+		//var cloneReader state.StateReader
+		/*
+			if traceTypeStateDiff {
+				cloneCache := stateCache.Clone()
+				cloneReader = state.NewCachedReader(stateReader, cloneCache)
+			}
+		*/
+		if args.txHash != nil {
+			ibs.Prepare(*args.txHash, header.Hash(), txIndex)
+		} else {
+			ibs.Prepare(libcommon.Hash{}, header.Hash(), txIndex)
+		}
+		execResult, err = core.ApplyMessage(evm, msg, gp, true /* refunds */, gasBailout /* gasBailout */)
+		if err != nil {
+			return nil, fmt.Errorf("first run for txIndex %d error: %w", txIndex, err)
+		}
+		traceResult.Output = common.CopyBytes(execResult.ReturnData)
+		/*if traceTypeStateDiff {
+			initialIbs := state.New(cloneReader)
+			sdMap := make(map[libcommon.Address]*StateDiffAccount)
+			traceResult.StateDiff = sdMap
+			sd := &StateDiff{sdMap: sdMap}
+			if err = ibs.FinalizeTx(evm.ChainRules(), sd); err != nil {
+				return nil, err
+			}
+			sd.CompareStates(initialIbs, ibs)
+			if err = ibs.CommitBlock(evm.ChainRules(), cachedWriter); err != nil {
+				return nil, err
+			}
+		} else {*/
+		if err = ibs.FinalizeTx(evm.ChainRules(), noop); err != nil {
+			return nil, err
+		}
+		if err = ibs.CommitBlock(evm.ChainRules(), cachedWriter); err != nil {
+			return nil, err
+		}
+		//}
+		/*if !traceTypeTrace {
+			traceResult.Trace = []*ParityTrace{}
+		}*/
+		results = append(results, traceResult)
+	}
+	return results, nil
+
+}
+
+func (api *ErigonImpl) SimulateTransactions(ctx context.Context, parms SimulateParam, parentNrOrHash *rpc.BlockNumberOrHash) ([]*SimulationResult, error) {
+	dbtx, err := api.db.BeginRo(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer dbtx.Rollback()
+
+	calls := parms.Transactions
+	var callParams []TraceCallParam
+	dec := json.NewDecoder(bytes.NewReader(calls))
+	tok, err := dec.Token()
+	if err != nil {
+		return nil, err
+	}
+	if tok != json.Delim('[') {
+		return nil, fmt.Errorf("expected array of [callparam, tracetypes]")
+	}
+	for dec.More() {
+		tok, err = dec.Token()
+		if err != nil {
+			return nil, err
+		}
+		if tok != json.Delim('[') {
+			return nil, fmt.Errorf("expected [callparam, tracetypes]")
+		}
+		callParams = append(callParams, TraceCallParam{})
+		args := &callParams[len(callParams)-1]
+		if err = dec.Decode(args); err != nil {
+			return nil, err
+		}
+		if err = dec.Decode(&args.traceTypes); err != nil {
+			return nil, err
+		}
+		tok, err = dec.Token()
+		if err != nil {
+			return nil, err
+		}
+		if tok != json.Delim(']') {
+			return nil, fmt.Errorf("expected end of [callparam, tracetypes]")
 		}
 	}
-	if traceTypeVmTrace {
-		traceResult.VmTrace = &VmTrace{Ops: []*VmTraceOp{}}
+	tok, err = dec.Token()
+	if err != nil {
+		return nil, err
 	}
-	var ot OeTracer
-	ot.compat = api.compatibility
-	if traceTypeTrace || traceTypeVmTrace {
-		ot.r = traceResult
-		ot.traceAddr = []int{}
-	}*/
-
-	// Get a new instance of the EVM.
+	if tok != json.Delim(']') {
+		return nil, fmt.Errorf("expected end of array of [callparam, tracetypes]")
+	}
 	var baseFee *uint256.Int
-	if header != nil && header.BaseFee != nil {
+	if parentNrOrHash == nil {
+		var num = rpc.LatestBlockNumber
+		parentNrOrHash = &rpc.BlockNumberOrHash{BlockNumber: &num}
+	}
+	blockNumber, hash, _, err := rpchelper.GetBlockNumber(*parentNrOrHash, dbtx, api.filters)
+	if err != nil {
+		return nil, err
+	}
+
+	// TODO: can read here only parent header
+	parentBlock, err := api.blockWithSenders(dbtx, hash, blockNumber)
+	if err != nil {
+		return nil, err
+	}
+	parentHeader := parentBlock.Header()
+	if parentHeader == nil {
+		return nil, fmt.Errorf("parent header %d(%x) not found", blockNumber, hash)
+	}
+	if parentHeader != nil && parentHeader.BaseFee != nil {
 		var overflow bool
-		baseFee, overflow = uint256.FromBig(header.BaseFee)
+		baseFee, overflow = uint256.FromBig(parentHeader.BaseFee)
 		if overflow {
 			return nil, fmt.Errorf("header.BaseFee uint256 overflow")
 		}
 	}
-	msg, err := args.ToMessage(500000, baseFee)
-	if err != nil {
-		return nil, err
-	}
-
-	blockCtx := transactions.NewEVMBlockContext(engine, header, blockNrOrHash.RequireCanonical, tx, api._blockReader)
-	txCtx := core.NewEVMTxContext(msg)
-
-	blockCtx.GasLimit = math.MaxUint64
-	blockCtx.MaxGasLimit = true
-
-	// get an assettracer
-	simTracer := NewSimulationTracer()
-	evm := vm.NewEVM(blockCtx, txCtx, ibs, chainConfig, vm.Config{Debug: true, Tracer: simTracer})
-
-	// Wait for the context to be done and cancel the evm. Even if the
-	// EVM has finished, cancelling may be done (repeatedly)
-	go func() {
-		<-ctx.Done()
-		evm.Cancel()
-	}()
-
-	gp := new(core.GasPool).AddGas(msg.Gas())
-	var execResult *core.ExecutionResult
-	ibs.Prepare(libcommon.Hash{}, libcommon.Hash{}, 0)
-	execResult, err = core.ApplyMessage(evm, msg, gp, true /* refunds */, true /* gasBailout */)
-	if err != nil {
-		return nil, err
-	}
-	simTracer.Resp.Output = common.CopyBytes(execResult.ReturnData)
-	//traceResult.Output = common.CopyBytes(execResult.ReturnData)
-	/*if traceTypeStateDiff {
-		sdMap := make(map[common.Address]*StateDiffAccount)
-		traceResult.StateDiff = sdMap
-		sd := &StateDiff{sdMap: sdMap}
-		if err = ibs.FinalizeTx(evm.ChainRules(), sd); err != nil {
-			return nil, err
+	msgs := make([]types.Message, len(callParams))
+	for i, args := range callParams {
+		msgs[i], err = args.ToMessage(500000, baseFee)
+		if err != nil {
+			return nil, fmt.Errorf("convert callParam to msg: %w", err)
 		}
-		// Create initial IntraBlockState, we will compare it with ibs (IntraBlockState after the transaction)
-		initialIbs := state.New(stateReader)
-		sd.CompareStates(initialIbs, ibs)
-	}*/
-
-	// If the timer caused an abort, return an appropriate error message
-	if evm.Cancelled() {
-		return nil, fmt.Errorf("execution aborted (timeout = %v)", api.evmCallTimeout)
 	}
-
-	return simTracer.Resp, nil
+	return api.doSimulateTransactions(ctx, dbtx, msgs, callParams, parentNrOrHash, nil, true /* gasBailout */, parms.Overrides)
 }
