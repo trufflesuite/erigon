@@ -448,7 +448,7 @@ func (api *ErigonImpl) SimulateTransactions(ctx context.Context, parms SimulateP
 	}
 	msgs := make([]types.Message, len(callParams))
 	for i, args := range callParams {
-		msgs[i], err = args.ToMessage(500000, baseFee)
+		msgs[i], err = args.ToMessage(5000000000, baseFee)
 		if err != nil {
 			return nil, fmt.Errorf("convert callParam to msg: %w", err)
 		}
