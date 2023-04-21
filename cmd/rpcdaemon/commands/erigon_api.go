@@ -43,7 +43,7 @@ type ErigonAPI interface {
 	// NodeInfo returns a collection of metadata known about the host.
 	NodeInfo(ctx context.Context) ([]p2p.NodeInfo, error)
 
-	SimulateTransactions(ctx context.Context, args SimulateParam, parentNrOrHash *rpc.BlockNumberOrHash) ([]*SimulationResult, error)
+	SimulateTransactions(ctx context.Context, args SimulateParam) ([]*SimulationResult, error)
 }
 
 // ErigonImpl is implementation of the ErigonAPI interface

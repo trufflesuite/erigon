@@ -40,41 +40,44 @@ type SimulateTransaction struct {
 
 // SimulateParam
 type SimulateParam struct {
-	Overrides *ethapi.StateOverrides `json:"overrides"`
-	// array of TraceCallParam
-	Transactions json.RawMessage        `json:"transactions"`
+	Overrides    *ethapi.StateOverrides `json:"overrides"`
+	Transactions json.RawMessage        `json:"transactions"` // array of TraceCallParam
 	BlockNumber  *rpc.BlockNumberOrHash `json:"block"`
 }
 
 type TxCall struct {
-	Address  *libcommon.Address `json:"address"`
+	From     *libcommon.Address `json:"from"`
+	To       *libcommon.Address `json:"to"`
 	Calldata hexutil.Bytes      `json:"calldata"`
+	Type     hexutil.Uint       `json:"type"`
+	Value    *hexutil.Big       `json:"value,omitempty"`
 }
 
 type TxLog struct {
-	Topic           hexutil.Bytes      `json:"topic"`
+	Topics          []hexutil.Bytes    `json:"topic,omitempty"`
 	Args            hexutil.Bytes      `json:"args"`
 	ContractAddress *libcommon.Address `json:"contractAddress"`
 }
 
 type SimulationResult struct {
-	TotalEthTransfer *hexutil.Big  `json:"total_eth"`
+	TotalEthTransfer *hexutil.Big  `json:"eth_to_caller"`
 	Output           hexutil.Bytes `json:"output"`
 	ErrCode          string        `json:"errcode"`
 	Valid            bool          `json:"valid"`
-	Calls            []TxCall      `json:"calls"`
-	Logs             []TxLog       `json:"logs"`
+	Calls            []*TxCall     `json:"calls,omitempty"`
+	Logs             []*TxLog      `json:"logs,omitempty"`
 }
 
 type SimulationTracer struct {
-	Resp *SimulationResult
+	Resp   *SimulationResult
+	Caller libcommon.Address
 }
 
 func NewSimulationTracer() *SimulationTracer {
 	return &SimulationTracer{
 		Resp: &SimulationResult{
-			Calls:            []TxCall{},
-			Logs:             []TxLog{},
+			Calls:            []*TxCall{},
+			Logs:             []*TxLog{},
 			TotalEthTransfer: new(hexutil.Big),
 			Valid:            true,
 		},
@@ -93,14 +96,15 @@ func (st *SimulationTracer) CaptureTxEnd(restGas uint64) {
 // Top call frame
 func (st *SimulationTracer) CaptureStart(env vm.VMInterface, from libcommon.Address, to libcommon.Address, precompile bool, create bool, input []byte, gas uint64, value *uint256.Int, code []byte) {
 	if st.Resp.Calls == nil {
-		st.Resp.Calls = []TxCall{}
+		st.Resp.Calls = []*TxCall{}
 	}
 	if st.Resp.Logs == nil {
-		st.Resp.Logs = []TxLog{}
+		st.Resp.Logs = []*TxLog{}
 	}
 
 	st.Resp.Valid = true
 	st.Resp.TotalEthTransfer = new(hexutil.Big)
+	st.Caller = from
 }
 
 func (st *SimulationTracer) CaptureEnd(output []byte, usedGas uint64, err error) {
@@ -109,11 +113,50 @@ func (st *SimulationTracer) CaptureEnd(output []byte, usedGas uint64, err error)
 
 // Rest of the frames
 func (st *SimulationTracer) CaptureEnter(typ vm.OpCode, from libcommon.Address, to libcommon.Address, precompile bool, create bool, input []byte, gas uint64, value *uint256.Int, code []byte) {
-
+	call := TxCall{
+		From:     &from,
+		To:       &to,
+		Calldata: input,
+		Type:     hexutil.Uint(typ),
+	}
+	if value != nil {
+		call.Value = (*hexutil.Big)(value.ToBig())
+	}
+	st.Resp.Calls = append(st.Resp.Calls, &call)
+	if bytes.Equal(to[:], st.Caller[:]) {
+		i := st.Resp.TotalEthTransfer
+		i.ToInt().Add(i.ToInt(), value.ToBig())
+	}
 }
 
 func (st *SimulationTracer) CaptureExit(output []byte, usedGas uint64, err error) {
 
+}
+
+func (st *SimulationTracer) recordLog(scope *vm.ScopeContext, topics int) {
+	log := &TxLog{}
+	offset := scope.Stack.Back(0).Uint64()
+	memlen := scope.Stack.Back(1).Uint64()
+	mem := scope.Memory.Data()
+	last := offset + memlen
+	if last >= uint64(len(mem)) {
+		last = uint64(len(mem))
+	}
+	if offset >= uint64(len(mem)) {
+		offset = 0
+	}
+	args := mem[offset:last]
+	address := scope.Contract.CodeAddr
+	log.Args = args
+	log.ContractAddress = address
+	if topics > 0 {
+		log.Topics = []hexutil.Bytes{}
+	}
+	for i := 1; i <= topics; i++ {
+		topic := scope.Stack.Back(i + 1)
+		log.Topics = append(log.Topics, topic.Bytes())
+	}
+	st.Resp.Logs = append(st.Resp.Logs, log)
 }
 
 // Opcode level
@@ -124,91 +167,49 @@ func (st *SimulationTracer) CaptureState(pc uint64, op vm.OpCode, gas, cost uint
 		return
 	}
 	switch op {
-	case 0xa1:
+	case vm.LOG0:
 		{
-			/*
-				var stack = [];
-
-					for(var i = 0; i < log.stack.length(); i++) {
-						stack.push('0x' + log.stack.peek(i).toString(16));
-					}
-					var offset = parseInt(stack[0], 16);
-					var len = parseInt(stack[1], 16);
-					var cd = log.memory.slice(offset, offset + len);
-					var str = '0x';
-					for(var elem in cd) {
-						str += ('0' + (cd[elem] & 0xFF).toString(16)).slice(-2);
-					}
-					cd = log.contract.getAddress();
-					var addr = '0x';
-					for(var elem in cd) {
-						addr += ('0' + (cd[elem] & 0xFF).toString(16)).slice(-2);
-					}
-					this.retVal.logs.push({topic: stack[2], args: str, contractAddress: addr});
-			*/
-			//stackArr := scope.Stack.Data()
-			offset := scope.Stack.Back(0).Uint64()
-			memlen := scope.Stack.Back(1).Uint64()
-			mem := scope.Memory.Data()
-			last := offset + memlen
-			if last >= uint64(len(mem)) {
-				last = uint64(len(mem))
-			}
-			if offset >= uint64(len(mem)) {
-				offset = 0
-			}
-			args := mem[offset:last]
-			topic := scope.Stack.Back(2)
-			address := scope.Contract.CodeAddr
-			log := TxLog{
-				Topic:           topic.Bytes(),
-				Args:            args,
-				ContractAddress: address,
-			}
-			st.Resp.Logs = append(st.Resp.Logs, log)
+			st.recordLog(scope, 0)
 		}
-	case 0xf1:
+	case vm.LOG1:
 		{
-			/*
-				f(log.op.toNumber() == 0xf1){
-				var stack = [];
-
-				for(var i = 0; i < log.stack.length(); i++) {
-					stack.push('0x' + log.stack.peek(i).toString(16));
-				}
-
-				var offset = parseInt(stack[3], 16);
-				var len = parseInt(stack[4], 16);
-				if (len >= 4)
-					len = 4;
-				var cd = log.memory.slice(offset, offset+len);
-				var str = '0x';
-				for(var elem in cd) {
-					str += ('0' + (cd[elem] & 0xFF).toString(16)).slice(-2);
-				}
-				this.retVal.calls.push({address: stack[1], calldata: str});
-
-			*/
-			//stackArr := scope.Stack.Data()
-			offset := scope.Stack.Back(3).Uint64() //stackArr[3].Uint64()
-			len := scope.Stack.Back(4).Uint64()
-			//fmt.Printf("CaptureState: opcode: %d offset: %s len: %s\n", op, stackArr[3].ToBig().Text(16), stackArr[4].ToBig().Text(16))
-			//scope.Stack.Print()
-			if len >= 4 {
-				len = 4
-			}
-			mem := scope.Memory.Data()
-			if offset+len > uint64(scope.Memory.Len()) {
-				return
-			}
-			calldata := mem[offset : offset+len]
-			addr := libcommon.BytesToAddress(scope.Stack.Back(1).Bytes())
-			call := TxCall{
-				Address:  &addr,
-				Calldata: calldata,
-			}
-			st.Resp.Calls = append(st.Resp.Calls, call)
+			st.recordLog(scope, 1)
 		}
+	case vm.LOG2:
+		{
+			st.recordLog(scope, 2)
+		}
+	case vm.LOG3:
+		{
+			st.recordLog(scope, 3)
+		}
+	case vm.LOG4:
+		{
+			st.recordLog(scope, 4)
+		}
+	/*case vm.CALL:
+	{
+
+		//stackArr := scope.Stack.Data()
+		offset := scope.Stack.Back(3).Uint64() //stackArr[3].Uint64()
+		len := scope.Stack.Back(4).Uint64()
+		//fmt.Printf("CaptureState: opcode: %d offset: %s len: %s\n", op, stackArr[3].ToBig().Text(16), stackArr[4].ToBig().Text(16))
+		//scope.Stack.Print()
+		if len >= 4 {
+			len = 4
+		}
+		mem := scope.Memory.Data()
+		if offset+len > uint64(scope.Memory.Len()) {
+			return
+		}
+		calldata := mem[offset : offset+len]
+		addr := libcommon.BytesToAddress(scope.Stack.Back(1).Bytes())
+		call := TxCall{
+			Address:  &addr,
+			Calldata: calldata,
+		}
+		st.Resp.Calls = append(st.Resp.Calls, call)
+	}*/
 	default:
 		{
 			// do nothing
@@ -217,7 +218,10 @@ func (st *SimulationTracer) CaptureState(pc uint64, op vm.OpCode, gas, cost uint
 }
 
 func (st *SimulationTracer) CaptureFault(pc uint64, op vm.OpCode, gas, cost uint64, scope *vm.ScopeContext, depth int, err error) {
-
+	st.Resp.Valid = false
+	if err != nil {
+		st.Resp.ErrCode = err.Error()
+	}
 }
 
 func (api *ErigonImpl) doSimulateTransactions(ctx context.Context, dbtx kv.Tx, msgs []types.Message, callParams []TraceCallParam, parentNrOrHash *rpc.BlockNumberOrHash, header *types.Header, gasBailout bool, overrides *ethapi.StateOverrides) ([]*SimulationResult, error) {
@@ -382,7 +386,7 @@ func (api *ErigonImpl) doSimulateTransactions(ctx context.Context, dbtx kv.Tx, m
 
 }
 
-func (api *ErigonImpl) SimulateTransactions(ctx context.Context, parms SimulateParam, parentNrOrHash *rpc.BlockNumberOrHash) ([]*SimulationResult, error) {
+func (api *ErigonImpl) SimulateTransactions(ctx context.Context, parms SimulateParam) ([]*SimulationResult, error) {
 	dbtx, err := api.db.BeginRo(ctx)
 	if err != nil {
 		return nil, err
@@ -430,6 +434,7 @@ func (api *ErigonImpl) SimulateTransactions(ctx context.Context, parms SimulateP
 	if tok != json.Delim(']') {
 		return nil, fmt.Errorf("expected end of array of [callparam, tracetypes]")
 	}
+	parentNrOrHash := parms.BlockNumber
 	var baseFee *uint256.Int
 	if parentNrOrHash == nil {
 		var num = rpc.LatestBlockNumber
