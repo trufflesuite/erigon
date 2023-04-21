@@ -42,7 +42,8 @@ type SimulateTransaction struct {
 type SimulateParam struct {
 	Overrides *ethapi.StateOverrides `json:"overrides"`
 	// array of TraceCallParam
-	Transactions json.RawMessage `json:"transactions"`
+	Transactions json.RawMessage        `json:"transactions"`
+	BlockNumber  *rpc.BlockNumberOrHash `json:"block"`
 }
 
 type TxCall struct {
@@ -91,7 +92,15 @@ func (st *SimulationTracer) CaptureTxEnd(restGas uint64) {
 
 // Top call frame
 func (st *SimulationTracer) CaptureStart(env vm.VMInterface, from libcommon.Address, to libcommon.Address, precompile bool, create bool, input []byte, gas uint64, value *uint256.Int, code []byte) {
+	if st.Resp.Calls == nil {
+		st.Resp.Calls = []TxCall{}
+	}
+	if st.Resp.Logs == nil {
+		st.Resp.Logs = []TxLog{}
+	}
 
+	st.Resp.Valid = true
+	st.Resp.TotalEthTransfer = new(hexutil.Big)
 }
 
 func (st *SimulationTracer) CaptureEnd(output []byte, usedGas uint64, err error) {
@@ -321,6 +330,7 @@ func (api *ErigonImpl) doSimulateTransactions(ctx context.Context, dbtx kv.Tx, m
 		// Create initial IntraBlockState, we will compare it with ibs (IntraBlockState after the transaction)
 		simTracer := NewSimulationTracer()
 		simTracer.Resp = traceResult
+
 		evm := vm.NewEVM(blockCtx, txCtx, ibs, chainConfig, vm.Config{Tracer: simTracer, Debug: true})
 
 		gp := new(core.GasPool).AddGas(msg.Gas())
