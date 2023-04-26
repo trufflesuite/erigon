@@ -19,6 +19,7 @@ type TraceAPI interface {
 	ReplayBlockTransactions(ctx context.Context, blockNr rpc.BlockNumberOrHash, traceTypes []string) ([]*TraceCallResult, error)
 	ReplayTransaction(ctx context.Context, txHash libcommon.Hash, traceTypes []string) (*TraceCallResult, error)
 	Call(ctx context.Context, call TraceCallParam, types []string, blockNr *rpc.BlockNumberOrHash) (*TraceCallResult, error)
+	CallAssets(ctx context.Context, call TraceCallParam, types []string, blockNr *rpc.BlockNumberOrHash) (*AssetTransferResp, error)
 	CallMany(ctx context.Context, calls json.RawMessage, blockNr *rpc.BlockNumberOrHash) ([]*TraceCallResult, error)
 	RawTransaction(ctx context.Context, txHash libcommon.Hash, traceTypes []string) ([]interface{}, error)
 
